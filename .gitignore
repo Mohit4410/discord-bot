@@ -1,0 +1,24 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Pip & virtual environment cache
+.cache/
+.local/
+venv/
+env/
+ENV/
+
+# Large archive files
+*.rar
+*.zip
+*.tar.gz
+
+# Environment variables (Do NOT push Discord Bot Token to GitHub!)
+.env
+
+# Media temp caches generated during runtime
+data/media_cache/

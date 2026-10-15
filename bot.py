@@ -10,6 +10,8 @@ import random
 import asyncio
 import logging
 import urllib.request
+import urllib.parse
+import html
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Literal, Tuple, Union
 from collections import OrderedDict
@@ -35,7 +37,7 @@ logger = logging.getLogger("Bot")
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-DEFAULT_PREFIX = os.getenv("BOT_PREFIX", "").strip()
+DEFAULT_PREFIX = os.getenv("BOT_PREFIX", "&").strip() or "&"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "bot_database.sqlite")
@@ -1729,6 +1731,7 @@ class CachedMessageWrapper:
 class Moveer(commands.Cog, name="Voice Management (Moveer)"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._summon_cooldowns: Dict[Tuple[int, int], float] = {}
 
     async def cog_check(self, ctx: commands.Context) -> bool:
         if ctx.guild and not self.bot.is_feature_enabled(ctx.guild.id, "moveer"):
@@ -2195,6 +2198,125 @@ class Moveer(commands.Cog, name="Voice Management (Moveer)"):
                 count += 1
             except Exception: pass
         await ctx.send(embed=voice_embed("Channel Undeafened", f"Server undeafened **{count}** member(s) in **{ch.name}**."))
+
+    @commands.hybrid_command(
+        name="summon",
+        aliases=["call", "invitevc"],
+        description="DM a user and invite them to join your current voice or text channel"
+    )
+    @app_commands.describe(
+        user="The member to summon",
+        reason="Optional reason or note to include in the DM"
+    )
+    async def summon(self, ctx: commands.Context, user: discord.Member, *, reason: Optional[str] = None):
+        guild = ctx.guild
+        if not guild:
+            return await ctx.send(embed=error_embed("Server Only", "This command can only be used in a server."), ephemeral=True)
+
+        target = user
+        if target.id == ctx.author.id:
+            return await ctx.send(embed=error_embed("Cannot Summon", "You cannot summon yourself!"), ephemeral=True)
+
+        if target.bot:
+            return await ctx.send(embed=error_embed("Cannot Summon", "Bots cannot be summoned via Direct Message!"), ephemeral=True)
+
+        # 1. Determine destination channel
+        # Priority:
+        # A. Voice channel the invoker is connected to
+        # B. Voice channel if the command was run in a voice channel's text chat
+        # C. Text channel where the command was executed
+        dest_channel = None
+        is_vc = False
+
+        if getattr(ctx.author, "voice", None) and ctx.author.voice.channel:
+            dest_channel = ctx.author.voice.channel
+            is_vc = True
+        elif isinstance(ctx.channel, (discord.VoiceChannel, discord.StageChannel)):
+            dest_channel = ctx.channel
+            is_vc = True
+        else:
+            dest_channel = ctx.channel
+            is_vc = False
+
+        # If target is already in the same VC
+        if is_vc and getattr(target, "voice", None) and target.voice.channel and target.voice.channel.id == dest_channel.id:
+            return await ctx.send(embed=info_embed("Already in Channel", f"{target.mention} is already in **🔊 {dest_channel.name}** with you!"), ephemeral=True)
+
+        # 2. Check if target has permission to see/join the channel
+        target_perms = dest_channel.permissions_for(target)
+        if not target_perms.view_channel:
+            return await ctx.send(embed=error_embed("Permission Denied", f"{target.mention} does not have permission to view **{dest_channel.name}**."), ephemeral=True)
+        if is_vc and not target_perms.connect:
+            return await ctx.send(embed=error_embed("Permission Denied", f"{target.mention} does not have permission to connect to voice channel **{dest_channel.name}**."), ephemeral=True)
+
+        # 3. Cooldown check (15 seconds per author-target pair to prevent spam)
+        now = time.time()
+        cd_key = (ctx.author.id, target.id)
+        last_summon = self._summon_cooldowns.get(cd_key, 0)
+        cooldown_duration = 15.0
+        if (now - last_summon) < cooldown_duration:
+            rem = int(cooldown_duration - (now - last_summon))
+            return await ctx.send(embed=error_embed("Cooldown Active", f"Please wait **{rem}s** before summoning {target.mention} again."), ephemeral=True)
+
+        # 4. Construct direct channel URL & interactive button
+        channel_url = f"https://discord.com/channels/{guild.id}/{dest_channel.id}"
+        view = ui.View()
+        btn_label = f"🚀 Join {dest_channel.name}" if is_vc else f"💬 Open #{dest_channel.name}"
+        btn_emoji = "🔊" if is_vc else "💬"
+        view.add_item(ui.Button(label=btn_label[:80], emoji=btn_emoji, style=discord.ButtonStyle.link, url=channel_url))
+
+        # 5. Build DM Embed
+        channel_display = f"🔊 **{dest_channel.name}**" if is_vc else f"💬 **#{dest_channel.name}**"
+        dm_color = COLOR_VOICE if is_vc else COLOR_INFO
+
+        dm_desc = (
+            f"👋 Hey {target.mention},\n\n"
+            f"**{ctx.author.display_name}** (`{ctx.author.name}`) is asking you to join {channel_display} in **{guild.name}**!"
+        )
+
+        dm_embed = discord.Embed(
+            title="📢 You have been summoned!",
+            description=dm_desc,
+            color=dm_color,
+            timestamp=datetime.now(timezone.utc)
+        )
+        guild_icon = guild.icon.url if guild.icon else None
+        if guild_icon:
+            dm_embed.set_thumbnail(url=guild_icon)
+        author_avatar = ctx.author.display_avatar.url if hasattr(ctx.author, "display_avatar") else None
+        dm_embed.set_author(name=f"Summon from {ctx.author.display_name}", icon_url=author_avatar)
+
+        dm_embed.add_field(name="🏰 Server", value=guild.name, inline=True)
+        dm_embed.add_field(name="📍 Channel", value=channel_display, inline=True)
+        dm_embed.add_field(name="👤 Summoned By", value=ctx.author.mention, inline=True)
+
+        if reason and reason.strip():
+            dm_embed.add_field(name="📝 Note / Reason", value=reason.strip()[:1000], inline=False)
+
+        dm_embed.set_footer(text=f"Server ID: {guild.id} • Sent via Moveer Sapphire")
+
+        # 6. Attempt to send DM
+        try:
+            await target.send(embed=dm_embed, view=view)
+            self._summon_cooldowns[cd_key] = now
+        except discord.Forbidden:
+            return await ctx.send(
+                embed=error_embed(
+                    "Direct Message Failed",
+                    f"Could not send a DM to {target.mention}.\nTheir Direct Messages are disabled or they have blocked DMs from server members."
+                ),
+                ephemeral=True
+            )
+        except Exception as dm_err:
+            return await ctx.send(
+                embed=error_embed("Summon Failed", f"Failed to send DM to {target.mention}: `{dm_err}`"),
+                ephemeral=True
+            )
+
+        # 7. Notify invoker of success
+        reason_suffix = f"\n*Note included:* \"{reason.strip()[:100]}\"" if reason and reason.strip() else ""
+        success_msg = f"Successfully summoned {target.mention}!\nSent them a Direct Message with a link to join {channel_display}.{reason_suffix}"
+        await ctx.send(embed=success_embed("Summon Sent", success_msg))
 
 # ==============================================================================
 # 9. COG: DYNAMIC VOICE (TEMP VOICE)
@@ -6135,6 +6257,112 @@ class Replay(commands.Cog, name="Replay (Video Embed Fixer)"):
     def _invalidate_cache(self, guild_id: int):
         self._cache.pop(guild_id, None)
 
+    async def _stream_download(self, session: aiohttp.ClientSession, url: str, max_size: int, headers: dict) -> Optional[io.BytesIO]:
+        try:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > max_size:
+                    return None
+                buf = io.BytesIO()
+                total = 0
+                async for chunk in resp.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if total > max_size:
+                        return None
+                    buf.write(chunk)
+                buf.seek(0)
+                return buf
+        except Exception:
+            return None
+
+    async def _fetch_replay_media(self, plat_key: str, orig_url: str, fixed_url: str, max_size: int = 10 * 1024 * 1024) -> Optional[Tuple[io.BytesIO, str]]:
+        discord_ua = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
+        browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        timeout = aiohttp.ClientTimeout(total=8, connect=4)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                video_url: Optional[str] = None
+                download_headers = {"User-Agent": browser_ua}
+
+                # 1. Instagram: extract direct og:video stream from zzinstagram preview
+                if plat_key == "instagram":
+                    try:
+                        headers = {"User-Agent": discord_ua}
+                        async with session.get(fixed_url, headers=headers) as resp:
+                            if resp.status == 200:
+                                text = await resp.text(errors="ignore")
+                                m = re.search(r'<meta\s+(?:property|name)=[\'"](?:og:video|og:video:secure_url)[\'"]\s+content=[\'"]([^\'"]+)[\'"]', text, re.I)
+                                if not m:
+                                    m = re.search(r'<meta\s+content=[\'"]([^\'"]+)[\'"]\s+(?:property|name)=[\'"](?:og:video|og:video:secure_url)[\'"]', text, re.I)
+                                if m:
+                                    video_url = html.unescape(m.group(1))
+                                    download_headers = {"User-Agent": discord_ua, "Referer": fixed_url}
+                    except Exception:
+                        pass
+
+                # 2. TikTok: extract direct video stream via TikWM API
+                elif plat_key == "tiktok":
+                    try:
+                        api_url = f"https://www.tikwm.com/api/?url={urllib.parse.quote(orig_url)}"
+                        async with session.get(api_url, headers={"User-Agent": browser_ua}) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                if data.get("code") == 0 and isinstance(data.get("data"), dict):
+                                    video_url = data["data"].get("play") or data["data"].get("wmplay")
+                    except Exception:
+                        pass
+
+                # 3. Twitter / X: extract via vxtwitter API or media URLs
+                elif plat_key == "twitter":
+                    try:
+                        tw_match = re.search(r"status/(\d+)", orig_url)
+                        if tw_match:
+                            tw_id = tw_match.group(1)
+                            vx_api = f"https://api.vxtwitter.com/Twitter/status/{tw_id}"
+                            async with session.get(vx_api, headers={"User-Agent": discord_ua}) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    for m in data.get("media_extended", []):
+                                        if isinstance(m, dict) and m.get("type") in ("video", "gif") and m.get("url"):
+                                            video_url = m["url"]
+                                            break
+                                    if not video_url:
+                                        for u in data.get("mediaURLs", []):
+                                            if u and (".mp4" in u or "video" in u):
+                                                video_url = u
+                                                break
+                    except Exception:
+                        pass
+
+                # 4. Fallback for any platform: check fixed_url HTML for og:video / twitter:player:stream
+                if not video_url and fixed_url:
+                    try:
+                        headers = {"User-Agent": discord_ua}
+                        async with session.get(fixed_url, headers=headers) as resp:
+                            if resp.status == 200:
+                                text = await resp.text(errors="ignore")
+                                m = re.search(r'<meta\s+(?:property|name)=[\'"](?:og:video|og:video:url|og:video:secure_url|twitter:player:stream)[\'"]\s+content=[\'"]([^\'"]+)[\'"]', text, re.I)
+                                if not m:
+                                    m = re.search(r'<meta\s+content=[\'"]([^\'"]+)[\'"]\s+(?:property|name)=[\'"](?:og:video|og:video:url|og:video:secure_url|twitter:player:stream)[\'"]', text, re.I)
+                                if m:
+                                    video_url = html.unescape(m.group(1))
+                                    download_headers = {"User-Agent": discord_ua, "Referer": fixed_url}
+                    except Exception:
+                        pass
+
+                if not video_url:
+                    return None
+
+                buf = await self._stream_download(session, video_url, max_size, download_headers)
+                if buf:
+                    return (buf, f"replay_{plat_key}.mp4")
+                return None
+        except Exception:
+            return None
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if not message.guild or message.author.bot:
@@ -6176,7 +6404,7 @@ class Replay(commands.Cog, name="Replay (Video Embed Fixer)"):
                 if any(r.get("restrict_type", "").lower() == "link" for r in rules):
                     return
 
-        converted_links: List[Tuple[str, str, str]] = []
+        converted_links: List[Tuple[str, str, str, str]] = []
         seen_urls = set()
 
         for plat_key, plat_name, pattern, fixer in self.patterns:
@@ -6190,7 +6418,7 @@ class Replay(commands.Cog, name="Replay (Video Embed Fixer)"):
                     continue
                 if fixed_url not in seen_urls:
                     seen_urls.add(fixed_url)
-                    converted_links.append((orig_url, fixed_url, plat_name))
+                    converted_links.append((orig_url, fixed_url, plat_name, plat_key))
 
         if not converted_links:
             return
@@ -6202,17 +6430,42 @@ class Replay(commands.Cog, name="Replay (Video Embed Fixer)"):
             except Exception:
                 pass
 
-        # Format reply
+        # Check if we can attach a downloadable video file directly
+        # Attaching the video as a discord.File lets Discord render the native video player with its
+        # built-in download arrow, allowing users to left-click and save the video without extra bot buttons.
+        uploaded_file = None
+        max_size = getattr(message.guild, "filesize_limit", 10 * 1024 * 1024)
         if len(converted_links) == 1:
-            orig, fixed, plat = converted_links[0]
+            orig, fixed, plat, plat_key = converted_links[0]
+            try:
+                media_res = await self._fetch_replay_media(plat_key, orig, fixed, max_size)
+                if media_res:
+                    buf, filename = media_res
+                    uploaded_file = discord.File(buf, filename=filename)
+            except Exception as e:
+                logger.debug(f"Failed to fetch replay video file: {e}")
+
+        # Format reply
+        if uploaded_file:
+            orig, fixed, plat, _ = converted_links[0]
+            reply_text = f"[Replay: {plat}](<{orig}>)"
+        elif len(converted_links) == 1:
+            orig, fixed, plat, _ = converted_links[0]
             reply_text = f"[Replay: {plat}](<{orig}>)\n{fixed}"
         else:
-            lines = [f"[Replay: {plat}](<{orig}>)\n{fixed}" for orig, fixed, plat in converted_links]
+            lines = [f"[Replay: {plat}](<{orig}>)\n{fixed}" for orig, fixed, plat, _ in converted_links]
             reply_text = "\n\n".join(lines)
 
         view = ReplayDeleteView(author_id=message.author.id, guild_owner_id=message.guild.owner_id)
         try:
-            sent_msg = await message.reply(content=reply_text, mention_author=False, view=view)
+            if uploaded_file:
+                try:
+                    sent_msg = await message.reply(content=reply_text, file=uploaded_file, mention_author=False, view=view)
+                except discord.HTTPException:
+                    fallback_text = f"[Replay: {plat}](<{orig}>)\n{fixed}"
+                    sent_msg = await message.reply(content=fallback_text, mention_author=False, view=view)
+            else:
+                sent_msg = await message.reply(content=reply_text, mention_author=False, view=view)
             view.message = sent_msg
         except (discord.Forbidden, discord.HTTPException):
             pass
@@ -8436,6 +8689,15 @@ HELP_CATEGORIES = {
                 "desc": "Configures the Join-to-Create dynamic temporary voice channel system.",
                 "perms": "Manage Channels",
                 "examples": ["/tempvoice setup", "&tempvoice setup"]
+            },
+            {
+                "name": "summon",
+                "syntax": "/summon user: @user [reason]",
+                "prefix_syntax": "&summon @user [reason]",
+                "aliases": ["call", "invitevc"],
+                "desc": "DMs a user with a direct jump link inviting them to your active voice or text channel.",
+                "perms": "Everyone",
+                "examples": ["/summon user: @Friend", "&summon @Friend Hop on VC!", "&summon @Friend Need 5th for scrim"]
             }
         ]
     },
@@ -9383,6 +9645,8 @@ class MoveerSapphireBot(commands.Bot):
         elif isinstance(error, commands.BotMissingPermissions):
             perms = ", ".join([p.replace("_", " ").title() for p in error.missing_permissions])
             embed = error_embed("Bot Missing Permission", f"Bot requires **{perms}** permission.")
+        elif isinstance(error, (commands.MemberNotFound, commands.UserNotFound)):
+            embed = error_embed("Member Not Found", f"Could not find member `{getattr(error, 'argument', 'user')}`.\nPlease mention them (e.g. `@Username`) or provide their User ID.")
         else:
             embed = error_embed("Command Error", str(error))
 
